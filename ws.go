@@ -120,7 +120,7 @@ func h(w http.ResponseWriter, r *http.Request) {
 		}
 
 		str := string(d)
-		fmt.Println(fmt.Sprintf("type: %v, content: %v", t, str))
+		fmt.Print(fmt.Sprintf("type: %v, content: %v", t, str))
 		if err := conn.WriteMessage(websocket.TextMessage, d); err != nil {
 			fmt.Println(fmt.Sprintf("write error: " + err.Error()))
 		}
