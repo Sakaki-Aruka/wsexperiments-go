@@ -71,8 +71,7 @@ func client() {
 				return
 			}
 
-			err = c.WriteMessage(websocket.TextMessage, []byte(line))
-			if err != nil {
+			if err := c.WriteMessage(websocket.TextMessage, []byte(line)); err != nil {
 				log.Println("write:", err)
 				return
 			}

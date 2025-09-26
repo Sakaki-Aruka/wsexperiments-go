@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/gorilla/websocket"
 )
@@ -31,14 +34,35 @@ func main() {
 		}
 		defer conn.Close()
 
-		if err := conn.WriteMessage(websocket.TextMessage, []byte(strings.Join(args, " "))); err != nil {
+		req := request{
+			SessionName: "",
+			Type:        "create",
+			Line:        strings.Join(args, " "),
+		}
+
+		j, err := json.Marshal(req)
+		if err != nil {
+			fmt.Println("json serialize error:", err)
+			return
+		}
+
+		if err := conn.WriteMessage(websocket.TextMessage, j); err != nil {
 			fmt.Println(err.Error())
 			os.Exit(1)
 		}
 
 		finishCh := make(chan bool)
+		var wg sync.WaitGroup
+		wg.Add(2)
 		go func() {
+			defer wg.Done()
 			for {
+				select {
+				case <-finishCh:
+					return
+				default:
+					//
+				}
 				t, out, err := conn.ReadMessage()
 				if err != nil {
 					break
@@ -48,8 +72,28 @@ func main() {
 				}
 				fmt.Println(fmt.Sprintf("type: %v, out: %v", t, string(out)))
 			}
-			close(finishCh)
 		}()
-		<-finishCh
+
+		go func() {
+			defer func() {
+				wg.Done()
+				finishCh <- true
+			}()
+			reader := bufio.NewReader(os.Stdin)
+			for {
+				line, err := reader.ReadString('\n')
+				if err != nil {
+					fmt.Println("stdin read error(main):", err)
+					return
+				}
+				if err := conn.WriteMessage(websocket.TextMessage, []byte(line)); err != nil {
+					fmt.Println("server websocket write error:", err)
+					fmt.Println("error str:", []byte(line))
+					return
+				}
+			}
+		}()
+
+		wg.Wait()
 	}
 }
