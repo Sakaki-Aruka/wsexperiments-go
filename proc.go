@@ -35,6 +35,8 @@ func main() {
 		return
 	}
 
+	inChannel := make(chan []byte)
+
 	go func() {
 		for {
 			buf := make([]byte, 1024)
@@ -45,11 +47,24 @@ func main() {
 			}
 			if n > 0 {
 				d := buf[:n]
-				fmt.Print(string(d))
+				inChannel <- d
+				//fmt.Print(string(d))
 			}
 		}
 		done <- struct{}{}
 		close(done)
+	}()
+
+	go func() {
+		for {
+			select {
+			case <-done:
+				close(inChannel)
+				return
+			case d := <-inChannel:
+				fmt.Print(string(d))
+			}
+		}
 	}()
 
 	go func() {
