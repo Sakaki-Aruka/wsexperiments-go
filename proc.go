@@ -24,16 +24,32 @@ func main() {
 		fmt.Println("failed to get stdout pipe")
 		return
 	}
-
-	stdoutScanner := bufio.NewScanner(stdout)
+	stdoutScanner := bufio.NewReader(stdout)
+	cmd.Stdin = os.Stdin
 	sig := make(chan os.Signal)
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGKILL, os.Interrupt)
+	done := make(chan struct{})
+
+	if err := cmd.Start(); err != nil {
+		fmt.Println("process start error: " + err.Error())
+		return
+	}
 
 	go func() {
-		for stdoutScanner.Scan() {
-			t := stdoutScanner.Text()
-			fmt.Println(t)
+		for {
+			buf := make([]byte, 1024)
+			n, err := stdoutScanner.Read(buf)
+			if err != nil {
+				fmt.Println("read error:", err)
+				break
+			}
+			if n > 0 {
+				d := buf[:n]
+				fmt.Print(string(d))
+			}
 		}
+		done <- struct{}{}
+		close(done)
 	}()
 
 	go func() {
@@ -45,9 +61,5 @@ func main() {
 		}
 	}()
 
-	if err := cmd.Start(); err != nil {
-		fmt.Println("process start error: " + err.Error())
-		return
-	}
-	cmd.Process.Wait()
+	<-done
 }
