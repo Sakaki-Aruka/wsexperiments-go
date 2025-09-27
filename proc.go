@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"sync"
 	"syscall"
 )
 
@@ -35,46 +36,59 @@ func main() {
 		return
 	}
 
-	inChannel := make(chan []byte)
+	outChannel := make(chan []byte)
+	var wg sync.WaitGroup
+	wg.Add(3)
 
 	go func() {
+		defer func() {
+			close(outChannel)
+			wg.Done()
+		}()
+		buf := make([]byte, 4096)
 		for {
-			buf := make([]byte, 1024)
 			n, err := stdoutScanner.Read(buf)
+			if n > 0 {
+				d := buf[:n]
+				outChannel <- d
+			}
+
 			if err != nil {
 				fmt.Println("read error:", err)
 				break
 			}
-			if n > 0 {
-				d := buf[:n]
-				inChannel <- d
-				//fmt.Print(string(d))
-			}
 		}
 		done <- struct{}{}
-		close(done)
 	}()
 
 	go func() {
+		defer wg.Done()
 		for {
 			select {
 			case <-done:
-				close(inChannel)
+				close(outChannel)
+				close(done)
 				return
-			case d := <-inChannel:
+			case d, ok := <-outChannel:
+				if !ok {
+					return
+				}
 				fmt.Print(string(d))
 			}
 		}
 	}()
 
 	go func() {
+		defer wg.Done()
 		select {
 		case s := <-sig:
 			if err := cmd.Process.Signal(s); err != nil {
 				fmt.Println("kill error: " + err.Error())
 			}
+		case <-done:
+			return
 		}
 	}()
 
-	<-done
+	wg.Wait()
 }
