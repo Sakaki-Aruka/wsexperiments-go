@@ -31,12 +31,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGTERM, syscall.SIGKILL, os.Interrupt)
 	done := make(chan struct{})
 
-	if err := cmd.Start(); err != nil {
-		fmt.Println("process start error: " + err.Error())
-		return
-	}
-
-	outChannel := make(chan []byte)
+	outChannel := make(chan []byte, 4096)
 	var wg sync.WaitGroup
 	wg.Add(3)
 
@@ -89,6 +84,11 @@ func main() {
 			return
 		}
 	}()
+
+	if err := cmd.Start(); err != nil {
+		fmt.Println("process start error: " + err.Error())
+		return
+	}
 
 	wg.Wait()
 }
