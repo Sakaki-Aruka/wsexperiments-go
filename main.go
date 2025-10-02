@@ -98,8 +98,8 @@ func main() {
 			go func() {
 				// read client input and send to a server
 				defer func() {
-					wg.Done()
 					conn.WriteMessage(websocket.CloseNormalClosure, make([]byte, 0))
+					wg.Done()
 				}()
 
 				buffer := make([]byte, 4096)
