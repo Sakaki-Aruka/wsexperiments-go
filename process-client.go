@@ -33,7 +33,26 @@ func p(w http.ResponseWriter, r *http.Request) {
 				log.Println("websocket err:", err)
 				return
 			}
-			log.Print("[out]", string(message))
+
+			var dp dataPost
+			if err := json.Unmarshal(message, &dp); err != nil {
+				log.Println("post unmarshal error:", err)
+				continue
+				//return
+			}
+
+			if dp.Type == "process" && len(connectionMap[dp.SessionName]) != 0 {
+				for connected := range connectionMap[dp.SessionName] {
+					if err := connected.WriteMessage(1, dp.Line); err != nil {
+						//debug
+						log.Println("name delete from map-2:", dp.SessionName)
+						delete(connectionMap, dp.SessionName)
+						log.Println("server broadcast error:", err)
+						connected.Close()
+					}
+				}
+			}
+			log.Print("[out]", string(dp.Line))
 		}
 	}()
 	wg.Wait()
@@ -54,10 +73,67 @@ type cReq struct {
 	Command     string   `json:"command"`
 }
 
+type dataPost struct {
+	Type        string `json:"type"`
+	SessionName string `json:"session_name"`
+	Line        []byte `json:"line"`
+}
+
+var connectionMap = make(map[string]map[*websocket.Conn]bool)
+
+// Key: SessionName, Value: Connections
+
+func connect(w http.ResponseWriter, r *http.Request) {
+	// header parse here?
+	// websocket.DefaultDialer.Dial 's second argument can receive http.Header <<-- USE THIS!!!
+	// 'X-WS-SESSION-NAME'
+
+	sessionName := r.Header.Get("X-WS-SESSION-NAME")
+	if _, exists := connectionMap[sessionName]; !exists {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte(fmt.Sprintf("'%v' not exists session name", sessionName)))
+		return
+	}
+
+	conn, _ := U.Upgrade(w, r, nil)
+	connectionMap[sessionName][conn] = true
+
+	//debug
+	log.Println("connection map:", connectionMap)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer func() {
+			wg.Done()
+
+			//debug
+			log.Println("name delete from map-3:", sessionName)
+			delete(connectionMap[sessionName], conn)
+		}()
+		for {
+			_, message, err := conn.ReadMessage()
+			if err != nil {
+				log.Println("websocket err:", err)
+				return
+			}
+
+			var dp dataPost
+			if err := json.Unmarshal(message, &dp); err != nil {
+				log.Println("post unmarshal error:", err)
+				continue
+			}
+
+			if dp.Type == "process" {
+				log.Print("[client]: " + string(dp.Line))
+			}
+		}
+	}()
+	wg.Wait()
+}
+
 func register(w http.ResponseWriter, r *http.Request) {
-	responseCode := 200
 	defer func() {
-		w.WriteHeader(responseCode)
 		if err := r.Body.Close(); err != nil {
 			log.Println("request body close error:", err)
 		}
@@ -65,7 +141,6 @@ func register(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != http.MethodPost {
 		log.Println(fmt.Sprintf("method '%v' is not allowed. (source: %v)", r.Method, r.RemoteAddr))
-		responseCode = http.StatusBadRequest
 		return
 	}
 
@@ -109,14 +184,21 @@ func startProcess(c cReq) error {
 	}
 	go func() {
 		u := url.URL{Scheme: "ws", Host: "localhost:8888", Path: "/socket"}
-		c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+		conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 
 		defer func() {
 			if cmd.ProcessState != nil && !cmd.ProcessState.Exited() {
 				cmd.Process.Kill()
 			}
 			cmd.Wait()
-			c.Close()
+			conn.Close()
+
+			//debug
+			log.Println("name delete from map-1:", c.SessionName)
+			for connected := range connectionMap[c.SessionName] {
+				connected.Close()
+			}
+			delete(connectionMap, c.SessionName)
 		}()
 
 		if err != nil {
@@ -133,7 +215,13 @@ func startProcess(c cReq) error {
 
 			if n > 0 {
 				data := buf[:n]
-				c.WriteMessage(1, data)
+				dataPost := dataPost{
+					Type:        "process",
+					SessionName: c.SessionName,
+					Line:        data,
+				}
+				j, _ := json.Marshal(dataPost)
+				conn.WriteMessage(1, j)
 			}
 		}
 	}()
@@ -142,6 +230,8 @@ func startProcess(c cReq) error {
 		log.Println("process start error:", err)
 		return err
 	}
+
+	connectionMap[c.SessionName] = map[*websocket.Conn]bool{}
 
 	return nil
 }
@@ -154,6 +244,7 @@ func main() {
 		http.HandleFunc("/socket", p)
 		http.HandleFunc("/http", normal)
 		http.HandleFunc("/register", register)
+		http.HandleFunc("/connect", connect)
 		if err := http.ListenAndServe(":8888", nil); err != nil {
 			log.Println("http server error:", err)
 			return
