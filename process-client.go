@@ -1,13 +1,18 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -34,12 +39,121 @@ func p(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 }
 
+func normal(w http.ResponseWriter, _ *http.Request) {
+	_, err := w.Write([]byte("hello world\n"))
+	if err != nil {
+		fmt.Println("failed to write response:", err)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+type cReq struct {
+	SessionName string   `json:"session_name"`
+	Env         []string `json:"env"`
+	Pwd         string   `json:"pwd"`
+	Command     string   `json:"command"`
+}
+
+func register(w http.ResponseWriter, r *http.Request) {
+	responseCode := 200
+	defer func() {
+		w.WriteHeader(responseCode)
+		if err := r.Body.Close(); err != nil {
+			log.Println("request body close error:", err)
+		}
+	}()
+
+	if r.Method != http.MethodPost {
+		log.Println(fmt.Sprintf("method '%v' is not allowed. (source: %v)", r.Method, r.RemoteAddr))
+		responseCode = http.StatusBadRequest
+		return
+	}
+
+	buf := new(bytes.Buffer)
+	io.Copy(buf, r.Body)
+	body := buf.Bytes()
+
+	var c cReq
+	if err := json.Unmarshal(body, &c); err != nil {
+		log.Fatal("create request unmarshal error:", err)
+		return
+	}
+
+	res, err := json.Marshal(c)
+	if err != nil {
+		log.Fatal("json marshal error:", err)
+		return
+	}
+	if _, err := w.Write(res); err != nil {
+		log.Fatal("response write error:", err)
+		return
+	}
+
+	if err := startProcess(c); err != nil {
+		log.Println("process start error:", err)
+		return
+	}
+
+}
+
+func startProcess(c cReq) error {
+	commands := strings.Split(c.Command, " ")
+	cmd := exec.Command(commands[0], commands[1:]...)
+	cmd.Env = c.Env
+	cmd.Dir = c.Pwd
+	buf := make([]byte, 4096)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		log.Println("stdout get error:", err)
+		return err
+	}
+	go func() {
+		u := url.URL{Scheme: "ws", Host: "localhost:8888", Path: "/socket"}
+		c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+
+		defer func() {
+			if cmd.ProcessState != nil && !cmd.ProcessState.Exited() {
+				cmd.Process.Kill()
+			}
+			cmd.Wait()
+			c.Close()
+		}()
+
+		if err != nil {
+			log.Println("dial:", err)
+			return
+		}
+
+		for {
+			n, err := stdout.Read(buf)
+			if err != nil {
+				log.Println("stdout error:", err)
+				return
+			}
+
+			if n > 0 {
+				data := buf[:n]
+				c.WriteMessage(1, data)
+			}
+		}
+	}()
+
+	if err := cmd.Start(); err != nil {
+		log.Println("process start error:", err)
+		return err
+	}
+
+	return nil
+}
+
 func main() {
 	flag.Parse()
 	args := flag.Args()
 	if len(args) == 0 {
 		// run server
 		http.HandleFunc("/socket", p)
+		http.HandleFunc("/http", normal)
+		http.HandleFunc("/register", register)
 		if err := http.ListenAndServe(":8888", nil); err != nil {
 			log.Println("http server error:", err)
 			return
