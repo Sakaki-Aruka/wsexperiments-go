@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/gorilla/websocket"
 )
@@ -41,9 +43,9 @@ func p(w http.ResponseWriter, r *http.Request) {
 				//return
 			}
 
-			if dp.Type == "process" && len(connectionMap[dp.SessionName]) != 0 {
+			if dp.Type == "process" {
 				for connected := range connectionMap[dp.SessionName] {
-					if err := connected.WriteMessage(1, dp.Line); err != nil {
+					if err := connected.WriteMessage(1, message); err != nil {
 						//debug
 						log.Println("name delete from map-2:", dp.SessionName)
 						delete(connectionMap, dp.SessionName)
@@ -51,8 +53,11 @@ func p(w http.ResponseWriter, r *http.Request) {
 						connected.Close()
 					}
 				}
+				log.Print("[out]", string(dp.Line))
+			} else if dp.Type == "user" {
+				log.Println(fmt.Sprintf("[p / client]: %v", string(message)))
+				conn.WriteMessage(1, message)
 			}
-			log.Print("[out]", string(dp.Line))
 		}
 	}()
 	wg.Wait()
@@ -80,8 +85,31 @@ type dataPost struct {
 }
 
 var connectionMap = make(map[string]map[*websocket.Conn]bool)
+var processes = make(map[string]*websocket.Conn)
 
 // Key: SessionName, Value: Connections
+
+func preconnect(w http.ResponseWriter, r *http.Request) {
+	sessionName := r.Header.Get("X-WS-SESSION-NAME")
+	if len(sessionName) == 0 {
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("invalid session name."))
+		return
+	}
+
+	conn, _ := U.Upgrade(w, r, nil)
+	defer conn.Close()
+	for {
+		if _, exists := connectionMap[sessionName]; !exists {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		} else {
+			conn.Close()
+			return
+		}
+	}
+
+}
 
 func connect(w http.ResponseWriter, r *http.Request) {
 	// header parse here?
@@ -92,6 +120,11 @@ func connect(w http.ResponseWriter, r *http.Request) {
 	if _, exists := connectionMap[sessionName]; !exists {
 		w.WriteHeader(http.StatusBadRequest)
 		w.Write([]byte(fmt.Sprintf("'%v' not exists session name", sessionName)))
+
+		//debug
+		log.Println(fmt.Sprintf("not exists map: %v", connectionMap))
+		log.Println("nanosecond:", time.Now())
+
 		return
 	}
 
@@ -124,8 +157,18 @@ func connect(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 
-			if dp.Type == "process" {
-				log.Print("[client]: " + string(dp.Line))
+			if dp.Type == "user" {
+				log.Print("[connect / client]: " + string(dp.Line))
+				if targetConn, exists := processes[dp.SessionName]; exists {
+					if err := targetConn.WriteMessage(websocket.TextMessage, message); err != nil {
+						log.Println("user input write error:", err)
+						continue
+					}
+
+					//debug
+					log.Println("process write ok:", string(message))
+					log.Println(fmt.Sprintf("processes: %v", processes))
+				}
 			}
 		}
 	}()
@@ -182,10 +225,22 @@ func startProcess(c cReq) error {
 		log.Println("stdout get error:", err)
 		return err
 	}
-	go func() {
-		u := url.URL{Scheme: "ws", Host: "localhost:8888", Path: "/socket"}
-		conn, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
 
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		log.Println("stdin get error:", err)
+		return err
+	}
+
+	end := make(chan struct{})
+
+	u := url.URL{Scheme: "ws", Host: "localhost:8888", Path: "/socket"}
+	header := http.Header{}
+	header.Set("X-WS-SESSION-NAME", c.SessionName)
+	connectionMap[c.SessionName] = make(map[*websocket.Conn]bool)
+	conn, _, err := websocket.DefaultDialer.Dial(u.String(), header)
+
+	go func() {
 		defer func() {
 			if cmd.ProcessState != nil && !cmd.ProcessState.Exited() {
 				cmd.Process.Kill()
@@ -199,6 +254,8 @@ func startProcess(c cReq) error {
 				connected.Close()
 			}
 			delete(connectionMap, c.SessionName)
+			delete(processes, c.SessionName)
+			//close(end)
 		}()
 
 		if err != nil {
@@ -206,32 +263,81 @@ func startProcess(c cReq) error {
 			return
 		}
 
+		processes[c.SessionName] = conn
+
 		for {
-			n, err := stdout.Read(buf)
+			select {
+			case <-end:
+				return
+			default:
+				n, err := stdout.Read(buf)
+				if err != nil {
+					log.Println("stdout error:", err)
+					return
+				}
+
+				if n > 0 {
+					data := buf[:n]
+					dataPost := dataPost{
+						Type:        "process",
+						SessionName: c.SessionName,
+						Line:        data,
+					}
+					j, _ := json.Marshal(dataPost)
+					conn.WriteMessage(1, j)
+				}
+			}
+		}
+	}()
+
+	go func() {
+		defer func() {
+			end <- struct{}{}
+		}()
+		for {
+			_, message, err := conn.ReadMessage()
 			if err != nil {
-				log.Println("stdout error:", err)
+				log.Println("process received message error:", err)
 				return
 			}
 
-			if n > 0 {
-				data := buf[:n]
-				dataPost := dataPost{
-					Type:        "process",
-					SessionName: c.SessionName,
-					Line:        data,
+			//debug
+			log.Println("process received message:", string(message))
+
+			var userPost dataPost
+			if err := json.Unmarshal(message, &userPost); err != nil {
+				log.Println("process received message unmarshal error:", err)
+				return
+			}
+
+			if userPost.Type == "user" {
+				in := userPost.Line
+				if !strings.HasSuffix(string(in), "\n") {
+					in = append(in, "\n"...)
 				}
-				j, _ := json.Marshal(dataPost)
-				conn.WriteMessage(1, j)
+				log.Print(fmt.Sprintf("in: %v", string(in)))
+
+				n, err := stdin.Write(in)
+				if err != nil {
+					log.Println("process write message error:", err)
+					return
+				}
+
+				//debug
+				log.Println(fmt.Sprintf("wrote %v bytes to stdin.", n))
 			}
 		}
 	}()
 
 	if err := cmd.Start(); err != nil {
 		log.Println("process start error:", err)
+		delete(connectionMap, c.SessionName)
 		return err
 	}
 
-	connectionMap[c.SessionName] = map[*websocket.Conn]bool{}
+	//debug
+	log.Println(fmt.Sprintf("added map: %v", connectionMap))
+	log.Println("nanosecond:", time.Now())
 
 	return nil
 }
@@ -245,76 +351,138 @@ func main() {
 		http.HandleFunc("/http", normal)
 		http.HandleFunc("/register", register)
 		http.HandleFunc("/connect", connect)
+		http.HandleFunc("/preconnect", preconnect)
 		if err := http.ListenAndServe(":8888", nil); err != nil {
 			log.Println("http server error:", err)
 			return
 		}
 	} else {
-		// <command...>
-		cmd := exec.Command(args[0], args[1:]...)
-		cmd.Env = os.Environ()
+		// <sessionName> <command...>
 
-		u := url.URL{Scheme: "ws", Host: "localhost:8888", Path: "/socket"}
+		// === process register === //
+		u := url.URL{Scheme: "http", Host: "localhost:8888", Path: "/register"}
+		pwd, _ := os.Getwd()
+		creq := cReq{
+			SessionName: args[0],
+			Env:         os.Environ(),
+			Pwd:         pwd,
+			Command:     strings.Join(args[1:], " "),
+		}
 
-		c, _, err := websocket.DefaultDialer.Dial(u.String(), nil)
+		//debug
+		fmt.Println("command:", strings.Join(args[1:], " "))
+
+		j, _ := json.Marshal(creq)
+		res, err := http.Post(u.String(), "application/json", bytes.NewReader(j))
 		if err != nil {
-			log.Fatal("dial:", err)
+			log.Println("http post error:", err)
+			return
+		}
+
+		//defer res.Body.Close()
+		res.Body.Close()
+
+		if res.StatusCode != http.StatusOK {
+			log.Println("http post response status error:", res.StatusCode)
+			body := make([]byte, res.ContentLength)
+			res.Body.Read(body)
+			log.Println("response body:", string(body))
+		}
+
+		// --- preconnect --- //
+		preUrl := url.URL{Scheme: "ws", Host: "localhost:8888", Path: "/preconnect"}
+		preHeader := http.Header{}
+		preHeader.Set("X-WS-SESSION-NAME", args[0])
+		preConn, _, err := websocket.DefaultDialer.Dial(preUrl.String(), preHeader)
+		if err != nil {
+			log.Println("preconnect dial error:", err)
+		}
+
+		for {
+			_, _, err := preConn.ReadMessage()
+			if err != nil {
+				log.Println("preconnect closed with error:", err)
+				break
+			}
+		}
+
+		// --- connect to a websocket --- //
+		dp := dataPost{
+			Type:        "user",
+			SessionName: args[0],
+			Line:        []byte(strings.Join(args[1:], " ")),
+		}
+		wsu := url.URL{Scheme: "ws", Host: "localhost:8888", Path: "/connect"}
+		header := http.Header{}
+		header.Add("X-WS-SESSION-NAME", args[0])
+		conn, _, err := websocket.DefaultDialer.Dial(wsu.String(), header)
+		if err != nil {
+			log.Println("websocket dial error:", err)
+			log.Println("url:", wsu.String())
 			return
 		}
 
 		defer func() {
-			c.Close()
+			conn.Close()
 		}()
 
-		sig := make(chan os.Signal)
-		signal.Notify(sig, os.Interrupt, syscall.SIGINT, syscall.SIGKILL)
-
+		sig := make(chan os.Signal, 2)
+		signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGKILL)
 		end := make(chan struct{})
-
+		stdin := bufio.NewScanner(os.Stdin)
 		var wg sync.WaitGroup
 		wg.Add(1)
 
-		stdout, err := cmd.StdoutPipe()
-		if err != nil {
-			log.Println("stdout get error")
-			return
-		}
-
-		buffer := make([]byte, 4096)
-
 		go func() {
+			// display process stdout
 			defer func() {
 				wg.Done()
-				close(sig)
-				close(end)
 			}()
 			for {
 				select {
 				case <-sig:
+					end <- struct{}{}
 					return
 				case <-end:
 					return
 				default:
-					n, err := stdout.Read(buffer)
+					_, message, err := conn.ReadMessage()
 					if err != nil {
-						log.Println("stdout error:", err)
+						log.Println("websocket read error:", err)
+						end <- struct{}{}
+						return
+					}
+					var dp dataPost
+					if err := json.Unmarshal(message, &dp); err != nil {
+						log.Println("received data unmarshal error:", err)
+						end <- struct{}{}
 						return
 					}
 
-					if n > 0 {
-						data := buffer[:n]
-						//log.Print("[out]", string(data))
-						c.WriteMessage(1, data)
+					if dp.Type == "process" {
+						fmt.Print(string(dp.Line))
 					}
 				}
 			}
 		}()
 
-		if err := cmd.Start(); err != nil {
-			log.Println("start error:", err)
-			end <- struct{}{}
-		}
+		// collect user input
+		for stdin.Scan() {
+			input := stdin.Bytes()
+			userPost := dataPost{
+				Type:        "user",
+				SessionName: dp.SessionName,
+				Line:        input,
+			}
+			userJ, _ := json.Marshal(userPost)
+			if err := conn.WriteMessage(websocket.TextMessage, userJ); err != nil {
+				log.Println("websocket write message error:", err)
+			}
 
-		wg.Wait()
+			//debug
+			log.Println("write message from client")
+		}
+		close(sig)
+		close(end)
 	}
 }
