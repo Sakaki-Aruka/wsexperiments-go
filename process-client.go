@@ -426,63 +426,122 @@ func main() {
 			conn.Close()
 		}()
 
-		sig := make(chan os.Signal, 2)
+		sig := make(chan os.Signal, 3)
 		signal.Notify(sig, os.Interrupt, syscall.SIGTERM, syscall.SIGKILL)
-		end := make(chan struct{})
+
+		end := make(chan struct{}, 3)
+		scan := make(chan bool, 1)
+
+		connClosed := false
+		sentEnd := false
+
 		stdin := bufio.NewScanner(os.Stdin)
 		var wg sync.WaitGroup
-		wg.Add(1)
+		wg.Add(3)
+
+		go func() {
+			defer func() {
+				if !sentEnd {
+					end <- struct{}{}
+					sentEnd = true
+
+					//debug
+					log.Println("send end 1")
+				}
+				if !connClosed {
+					if err := conn.Close(); err != nil {
+						log.Println("websocket connection close error:", err)
+					}
+					connClosed = true
+				}
+				wg.Done()
+
+				//debug
+				log.Println("wg done 1")
+			}()
+			select {
+			case <-sig:
+				return
+			case <-end:
+				return
+
+			}
+		}()
 
 		go func() {
 			// display process stdout
 			defer func() {
+				if !sentEnd {
+					end <- struct{}{}
+					sentEnd = true
+
+					//debug
+					log.Println("send end 2")
+				}
 				wg.Done()
+
+				//debug
+				log.Println("wg done 2")
+			}()
+			for {
+				_, message, err := conn.ReadMessage()
+				if err != nil {
+					log.Println("websocket read error:", err)
+					return
+				}
+				var dp dataPost
+				if err := json.Unmarshal(message, &dp); err != nil {
+					log.Println("received data unmarshal error:", err)
+					return
+				}
+
+				if dp.Type == "process" {
+					fmt.Print(string(dp.Line))
+				}
+			}
+		}()
+
+		go func() {
+			defer func() {
+				if !sentEnd {
+					end <- struct{}{}
+
+					//debug
+					log.Println("send end 3")
+				}
+				wg.Done()
+
+				//debug
+				log.Println("wg done 3")
 			}()
 			for {
 				select {
 				case <-sig:
-					end <- struct{}{}
 					return
 				case <-end:
 					return
-				default:
-					_, message, err := conn.ReadMessage()
-					if err != nil {
-						log.Println("websocket read error:", err)
-						end <- struct{}{}
+				case scan <- stdin.Scan():
+					if <-scan {
+						input := stdin.Bytes()
+						userPost := dataPost{
+							Type:        "user",
+							SessionName: dp.SessionName,
+							Line:        input,
+						}
+						userJ, _ := json.Marshal(userPost)
+						if err := conn.WriteMessage(websocket.TextMessage, userJ); err != nil {
+							log.Println("websocket write message error:", err)
+						}
+					} else {
+						// received eof or else
 						return
-					}
-					var dp dataPost
-					if err := json.Unmarshal(message, &dp); err != nil {
-						log.Println("received data unmarshal error:", err)
-						end <- struct{}{}
-						return
-					}
-
-					if dp.Type == "process" {
-						fmt.Print(string(dp.Line))
 					}
 				}
 			}
 		}()
 
-		// collect user input
-		for stdin.Scan() {
-			input := stdin.Bytes()
-			userPost := dataPost{
-				Type:        "user",
-				SessionName: dp.SessionName,
-				Line:        input,
-			}
-			userJ, _ := json.Marshal(userPost)
-			if err := conn.WriteMessage(websocket.TextMessage, userJ); err != nil {
-				log.Println("websocket write message error:", err)
-			}
-
-			//debug
-			log.Println("write message from client")
-		}
-		close(sig)
-		close(end)
+		//debug
+		log.Println("after end channel send")
+		wg.Wait()
 	}
 }
